@@ -1,4 +1,5 @@
-// src/executor/mod.rs
+// src/executor.rs
+use crate::telegram::{TelegramMsg, TelegramNotifier};
 use crate::types::{
     ArbitrageRoute, BotMetrics, ExecutionStatus, TradeResult,
 };
@@ -58,6 +59,7 @@ pub struct TradeExecutor {
     private_key:      String,
     simulation_mode:  bool,
     metrics:          Arc<Mutex<BotMetrics>>,
+    tg:               Arc<TelegramNotifier>,
 }
 
 impl TradeExecutor {
@@ -67,16 +69,17 @@ impl TradeExecutor {
         private_key:      String,
         simulation_mode:  bool,
         metrics:          Arc<Mutex<BotMetrics>>,
+        tg:               Arc<TelegramNotifier>,
     ) -> Self {
-        Self { contract_address, provider_url, private_key, simulation_mode, metrics }
+        Self { contract_address, provider_url, private_key, simulation_mode, metrics, tg }
     }
 
     pub async fn execute(&self, params: ExecutionParams) -> TradeResult {
         let trade_id = Uuid::new_v4();
-        let mode     = if self.simulation_mode { "SIM" } else { "LIVE" };
+        let mode     = if self.simulation_mode { "[SIM]" } else { "[LIVE]" };
 
         info!(
-            "[{mode}] Trade {trade_id}: {} hop | profit est. ${:.4}",
+            "{mode} Trade {trade_id}: {} hop | profit est. ${:.4}",
             params.route.hop_count(),
             params.route.net_profit_usd
         );
@@ -88,21 +91,54 @@ impl TradeExecutor {
         };
 
         // Update metrics
-        let mut m = self.metrics.lock().await;
-        m.total_trades_executed += 1;
-        match &result.status {
-            ExecutionStatus::Confirmed { actual_profit_usd, .. } => {
-                m.total_trades_successful += 1;
-                m.total_profit_usd        += actual_profit_usd;
+        {
+            let mut m = self.metrics.lock().await;
+            m.total_trades_executed += 1;
+            match &result.status {
+                ExecutionStatus::Confirmed { actual_profit_usd, .. } => {
+                    m.total_trades_successful += 1;
+                    m.total_profit_usd        += actual_profit_usd;
+                }
+                ExecutionStatus::Reverted { .. } => {
+                    m.total_trades_reverted += 1;
+                }
+                _ => {}
             }
-            ExecutionStatus::Reverted { .. } => {
-                m.total_trades_reverted += 1;
+            m.update_derived();
+        }
+
+        // Kirim notifikasi Telegram berdasarkan hasil
+        self.notify_result(&result, mode).await;
+
+        result
+    }
+
+    async fn notify_result(&self, result: &TradeResult, mode: &str) {
+        match &result.status {
+            ExecutionStatus::Confirmed { tx_hash, block, actual_profit_usd } => {
+                let gas_cost = result.gas_used.unwrap_or(220_000) as f64
+                    * result.gas_price_gwei.unwrap_or(50.0)
+                    * 1e-9
+                    * 0.80; // MATIC price approx
+                self.tg.send_md(&TelegramMsg::trade_success(
+                    tx_hash,
+                    *actual_profit_usd,
+                    gas_cost,
+                    *block,
+                    mode,
+                )).await;
+            }
+            ExecutionStatus::Reverted { reason, .. } => {
+                let input_usd = result.route.optimal_input.to::<u128>() as f64 / 1e6;
+                self.tg.send_md(&TelegramMsg::trade_reverted(
+                    reason, input_usd, mode
+                )).await;
+            }
+            ExecutionStatus::Failed { reason } => {
+                self.tg.send_md(&TelegramMsg::trade_failed(reason)).await;
             }
             _ => {}
         }
-        m.update_derived();
-
-        result
     }
 
     async fn simulate_execution(
@@ -121,7 +157,7 @@ impl TradeExecutor {
 
         let tx = TransactionRequest::default()
             .with_to(self.contract_address)
-            .with_input(calldata.clone())
+            .with_input(calldata)
             .with_from(Address::ZERO);
 
         match provider.call(&tx).await {
@@ -239,13 +275,24 @@ impl TradeExecutor {
     }
 
     fn encode_calldata(&self, params: &ExecutionParams) -> Vec<u8> {
+        // Konversi fee dari bps ke Uniswap fee unit (bps * 10 = fee ppm)
+        // V2: 30 bps = 300 fee units (0.3%)
+        // V3: 5 bps = 500, 30 bps = 3000, 100 bps = 10000
         let steps: Vec<IArbitrageExecutor::SwapStep> = params.route.steps.iter()
-            .map(|s| IArbitrageExecutor::SwapStep {
-                pool:     s.pool_address,
-                tokenIn:  s.token_in,
-                tokenOut: s.token_out,
-                fee: alloy::primitives::Uint::<24, 1>::from((s.fee_tier.bps() as u32) * 100),
-                isV3:     matches!(s.dex_type, crate::types::DexType::UniswapV3),
+            .map(|s| {
+                let fee_val = match s.fee_tier {
+                    crate::types::FeeTier::V2_30  => 3000u32,  // 0.3%
+                    crate::types::FeeTier::V3_5   => 500u32,   // 0.05%
+                    crate::types::FeeTier::V3_30  => 3000u32,  // 0.3%
+                    crate::types::FeeTier::V3_100 => 10000u32, // 1%
+                };
+                IArbitrageExecutor::SwapStep {
+                    pool:     s.pool_address,
+                    tokenIn:  s.token_in,
+                    tokenOut: s.token_out,
+                    fee:      alloy::primitives::Uint::<24, 1>::from(fee_val),
+                    isV3:     matches!(s.dex_type, crate::types::DexType::UniswapV3),
+                }
             })
             .collect();
 
@@ -294,6 +341,10 @@ impl TradeLogger {
 
     pub async fn log_trade(&self, result: &TradeResult) -> Result<()> {
         use tokio::io::AsyncWriteExt;
+        // Buat parent dir jika belum ada
+        if let Some(parent) = std::path::Path::new(&self.log_path).parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true).append(true)
             .open(&self.log_path).await?;
@@ -310,7 +361,7 @@ impl TradeLogger {
             if let Ok(r) = serde_json::from_str::<TradeResult>(line) {
                 stats.total_trades += 1;
                 if let ExecutionStatus::Confirmed { actual_profit_usd, .. } = &r.status {
-                    stats.successful     += 1;
+                    stats.successful       += 1;
                     stats.total_profit_usd += actual_profit_usd;
                 } else if matches!(r.status, ExecutionStatus::Reverted { .. }) {
                     stats.reverted += 1;
