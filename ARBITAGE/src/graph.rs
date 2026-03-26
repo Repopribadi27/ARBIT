@@ -1,12 +1,11 @@
-// src/graph/mod.rs
+// src/graph.rs
 use crate::types::{ArbitrageRoute, DexType, FeeTier, PoolStateV2, RouteStep};
 use crate::math::{optimal_input_two_hop, optimal_input_three_hop, simulate_multihop, u256_to_f64};
 use alloy::primitives::{Address, U256};
 use chrono::Utc;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::trace;
 use uuid::Uuid;
 
 type NodeId = Address;
@@ -42,7 +41,9 @@ impl PoolEdge {
         let rate = (u256_to_f64(reserve_out) * pool.fee_tier.multiplier())
             / u256_to_f64(reserve_in);
 
-        if rate <= 0.0 { return None; }
+        if rate <= 0.0 || !rate.is_finite() {
+            return None;
+        }
 
         Some(PoolEdge {
             pool_address: pool.address,
@@ -77,10 +78,15 @@ impl ArbitrageGraph {
     }
 
     pub fn update_pool(&self, pool: &PoolStateV2) {
-        let nc = self.nodes.len();
-        self.nodes.entry(pool.token0).or_insert(nc);
-        let nc = self.nodes.len();
-        self.nodes.entry(pool.token1).or_insert(nc);
+        // FIX: Gunakan len() snapshot sebelum insert untuk index yang konsisten
+        if !self.nodes.contains_key(&pool.token0) {
+            let idx = self.nodes.len();
+            self.nodes.insert(pool.token0, idx);
+        }
+        if !self.nodes.contains_key(&pool.token1) {
+            let idx = self.nodes.len();
+            self.nodes.insert(pool.token1, idx);
+        }
 
         for (ti, to) in [(pool.token0, pool.token1), (pool.token1, pool.token0)] {
             if let Some(edge) = PoolEdge::new(pool, ti, to) {
@@ -97,13 +103,16 @@ impl ArbitrageGraph {
         self.update_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Ambil semua edges — SEMUA pool per pasangan token, bukan hanya yang terbaik.
+    /// FIX: sebelumnya hanya ambil 1 edge terbaik per pair, sehingga melewatkan
+    /// peluang arbitrase antar pool yang berbeda untuk pasangan token yang sama.
     pub fn all_edges_flat(&self) -> Vec<PoolEdge> {
         let mut result = Vec::new();
         for entry in self.edges.iter() {
-            if let Some(best) = entry.value().iter()
-                .min_by(|a, b| a.log_weight.partial_cmp(&b.log_weight).unwrap())
-            {
-                result.push(best.clone());
+            for edge in entry.value().iter() {
+                if edge.reserve_in > U256::ZERO && edge.reserve_out > U256::ZERO {
+                    result.push(edge.clone());
+                }
             }
         }
         result
@@ -124,11 +133,24 @@ pub struct ArbitrageCycle {
     pub block_number:     u64,
 }
 
+impl ArbitrageCycle {
+    /// Fingerprint unik berdasarkan pool addresses yang terlibat (urutan sorted).
+    /// Digunakan untuk deduplication — hindari melaporkan cycle yang sama
+    /// berkali-kali dari source token berbeda.
+    pub fn fingerprint(&self) -> Vec<Address> {
+        let mut addrs: Vec<Address> = self.edges.iter()
+            .map(|e| e.pool_address)
+            .collect();
+        addrs.sort();
+        addrs
+    }
+}
+
 // ── Bellman-Ford Detector ─────────────────────────────────────────────────────
 
 pub struct BellmanFordDetector {
-    graph:    Arc<ArbitrageGraph>,
-    max_hops: usize,
+    graph:         Arc<ArbitrageGraph>,
+    max_hops:      usize,
     min_threshold: f64,
 }
 
@@ -153,17 +175,28 @@ impl BellmanFordDetector {
             return vec![];
         }
 
-        let mut all_cycles = Vec::new();
+        let mut all_cycles: Vec<ArbitrageCycle> = Vec::new();
+        // FIX: Deduplication — hindari melaporkan cycle yang persis sama
+        // (pool addresses sama) dari source token yang berbeda
+        let mut seen_fingerprints: HashSet<Vec<Address>> = HashSet::new();
 
         for &source in &self.graph.base_tokens {
             if !self.graph.nodes.contains_key(&source) {
                 continue;
             }
             let cycles = self.bellman_ford(source, &edges, &nodes, block_number);
-            all_cycles.extend(cycles);
-            if all_cycles.len() >= max_results * 2 { break; }
+            for cycle in cycles {
+                let fp = cycle.fingerprint();
+                if seen_fingerprints.insert(fp) {
+                    all_cycles.push(cycle);
+                }
+            }
+            if all_cycles.len() >= max_results * 3 {
+                break;
+            }
         }
 
+        // Sort: cycle paling profitable (log_weight paling negatif) di depan
         all_cycles.sort_by(|a, b| {
             a.total_log_weight.partial_cmp(&b.total_log_weight).unwrap()
         });
@@ -186,8 +219,8 @@ impl BellmanFordDetector {
             None     => return vec![],
         };
 
-        let mut dist: Vec<f64>             = vec![f64::INFINITY; n];
-        let mut pred: Vec<Option<(usize, usize)>> = vec![None; n]; // (prev_node_idx, edge_idx)
+        let mut dist: Vec<f64>                   = vec![f64::INFINITY; n];
+        let mut pred: Vec<Option<(usize, usize)>> = vec![None; n];
         dist[src_idx] = 0.0;
 
         let max_iters = self.max_hops.min(n.saturating_sub(1));
@@ -210,16 +243,31 @@ impl BellmanFordDetector {
 
         // Deteksi negative cycle yang kembali ke source
         let mut cycles = Vec::new();
+        // FIX: Gunakan HashSet untuk cegah duplicate pool dalam satu cycle
+        let mut seen_cycle_pools: HashSet<Vec<Address>> = HashSet::new();
+
         for (ei, edge) in edges.iter().enumerate() {
             let u = match node_idx.get(&edge.token_in)  { Some(&i) => i, None => continue };
             let v = match node_idx.get(&edge.token_out) { Some(&i) => i, None => continue };
+
+            // Hanya cycle yang kembali ke source
             if v != src_idx || dist[u] == f64::INFINITY { continue; }
 
             let cycle_w = dist[u] + edge.log_weight;
-            if cycle_w < -self.min_threshold {
-                if let Some(path_edges) = self.reconstruct_path(
-                    src_idx, u, ei, edges, &pred, n
-                ) {
+            if cycle_w >= -self.min_threshold { continue; }
+
+            if let Some(path_edges) = self.reconstruct_path(src_idx, u, ei, edges, &pred, n) {
+                // FIX: Pastikan tidak ada pool address yang duplikat dalam satu cycle
+                let pool_addrs: HashSet<Address> = path_edges.iter()
+                    .map(|e| e.pool_address)
+                    .collect();
+                if pool_addrs.len() != path_edges.len() {
+                    continue; // Ada pool duplikat, skip
+                }
+
+                let mut fp: Vec<Address> = pool_addrs.into_iter().collect();
+                fp.sort();
+                if seen_cycle_pools.insert(fp) {
                     cycles.push(ArbitrageCycle {
                         edges: path_edges,
                         total_log_weight: cycle_w,
@@ -234,31 +282,43 @@ impl BellmanFordDetector {
 
     fn reconstruct_path(
         &self,
-        src_idx:   usize,
-        u_idx:     usize,
-        final_ei:  usize,
-        edges:     &[PoolEdge],
-        pred:      &[Option<(usize, usize)>],
-        n:         usize,
+        src_idx:  usize,
+        u_idx:    usize,
+        final_ei: usize,
+        edges:    &[PoolEdge],
+        pred:     &[Option<(usize, usize)>],
+        n:        usize,
     ) -> Option<Vec<PoolEdge>> {
         let mut path = vec![edges[final_ei].clone()];
         let mut cur  = u_idx;
+        // FIX: seen harus include src_idx agar bisa berhenti, tapi
+        // jangan block src_idx di awal — kita mau path KEMBALI ke src_idx
         let mut seen = vec![false; n];
         seen[cur] = true;
 
+        let max_steps = self.max_hops + 1;
+
         loop {
             if cur == src_idx { break; }
+            if path.len() >= max_steps { return None; }
+
             match pred[cur] {
                 Some((prev, ei)) => {
-                    if seen[prev] && prev != src_idx { return None; }
+                    // FIX: Hanya block revisit jika prev bukan src_idx
+                    // (src_idx boleh dikunjungi di akhir untuk menutup cycle)
+                    if seen[prev] && prev != src_idx {
+                        return None;
+                    }
                     seen[prev] = true;
                     path.push(edges[ei].clone());
                     cur = prev;
                 }
                 None => return None,
             }
-            if path.len() > self.max_hops { return None; }
         }
+
+        if path.len() < 2 { return None; } // Minimum 2 hop untuk arbitrase
+
         path.reverse();
         Some(path)
     }
@@ -307,7 +367,7 @@ impl RouteEvaluator {
         let profit_human = u256_to_f64(expected_profit) / 10f64.powi(dec);
         let profit_usd   = profit_human * token_price_usd;
 
-        let gas_cost_usd = 225_000f64 * 50.0 * 1e-9 * 0.80; // ~$0.009
+        let gas_cost_usd = 225_000f64 * 50.0 * 1e-9 * 0.80;
 
         Some(ArbitrageRoute {
             id:              Uuid::new_v4(),

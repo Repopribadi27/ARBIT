@@ -1,4 +1,4 @@
-// src/monitor/mod.rs
+// src/monitor.rs
 //! Monitor WebSocket real-time untuk event Sync DEX V2.
 
 use crate::graph::ArbitrageGraph;
@@ -21,10 +21,6 @@ use tracing::{debug, info, warn};
 // Sync event topic: keccak256("Sync(uint112,uint112)")
 const SYNC_TOPIC: B256 =
     b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
-
-// ── ABI via sol! macro ────────────────────────────────────────────────────────
-// CATATAN: Ganti nama event dari "Sync" -> "PairSync" untuk hindari konflik
-// dengan std::marker::Sync trait
 
 sol! {
     #[sol(rpc)]
@@ -81,6 +77,11 @@ impl PoolRegistry {
         block_number: u64,
     ) -> bool {
         if let Some(mut pool) = self.pools.get_mut(&pool_address) {
+            // FIX: Skip update jika reserve tidak berubah sama sekali
+            // (menghindari graph update yang tidak perlu)
+            if pool.reserve0 == reserve0 && pool.reserve1 == reserve1 {
+                return false;
+            }
             pool.reserve0     = reserve0;
             pool.reserve1     = reserve1;
             pool.block_number = block_number;
@@ -134,7 +135,6 @@ impl DexMonitor {
 
         info!("WebSocket terhubung");
 
-        // Phase 1: Discover pools via HTTP provider (lebih stabil untuk eth_call)
         let http_provider = ProviderBuilder::new()
             .on_builtin(&self.http_url)
             .await?;
@@ -142,9 +142,17 @@ impl DexMonitor {
 
         info!("Menemukan pools dari {} factory...", self.factories.len());
         self.discover_pools(http_provider).await?;
-        info!("Total {} pools ditemukan", self.pool_registry.pool_count());
 
-        // Phase 2: Subscribe Sync events via WebSocket
+        let pool_count = self.pool_registry.pool_count();
+        info!("Total {} pools ditemukan", pool_count);
+
+        // FIX: Jangan lanjut subscribe jika tidak ada pool yang ditemukan
+        if pool_count == 0 {
+            return Err(anyhow::anyhow!(
+                "Tidak ada pool yang ditemukan! Periksa factory address dan koneksi RPC."
+            ));
+        }
+
         info!("Subscribe ke Sync events...");
         self.subscribe_sync_events(provider).await?;
 
@@ -160,7 +168,6 @@ impl DexMonitor {
             token_pairs.len(), self.factories.len());
 
         for (factory_addr, dex_type, fee_tier) in &self.factories {
-            // FIX: gunakan IUniswapV2Factory::new() langsung (bukan IUniswapV2FactoryInstance)
             let factory = IUniswapV2Factory::new(*factory_addr, provider.clone());
 
             for (token_a, token_b) in &token_pairs {
@@ -172,8 +179,13 @@ impl DexMonitor {
                         }
                         match self.fetch_pool_state(&provider, pair_addr, *dex_type, *fee_tier).await {
                             Ok(pool) => {
-                                self.pool_registry.register_pool(pool.clone());
-                                self.graph.update_pool(&pool);
+                                // FIX: Hanya register pool jika punya liquiditas cukup
+                                if pool.reserve0 > U256::ZERO && pool.reserve1 > U256::ZERO {
+                                    self.graph.update_pool(&pool);
+                                    self.pool_registry.register_pool(pool);
+                                } else {
+                                    debug!("Pool {pair_addr} dilewati: reserve kosong");
+                                }
                             }
                             Err(e) => debug!("fetch_pool_state error {pair_addr}: {e}"),
                         }
@@ -193,12 +205,11 @@ impl DexMonitor {
         dex_type:  DexType,
         fee_tier:  FeeTier,
     ) -> Result<PoolStateV2> {
-        // FIX: gunakan IUniswapV2Pair::new() langsung (bukan IUniswapV2PairInstance)
         let pair = IUniswapV2Pair::new(pool_addr, provider.clone());
 
-        let token0_ret    = pair.token0().call().await?;
-        let token1_ret    = pair.token1().call().await?;
-        let reserves_ret  = pair.getReserves().call().await?;
+        let token0_ret   = pair.token0().call().await?;
+        let token1_ret   = pair.token1().call().await?;
+        let reserves_ret = pair.getReserves().call().await?;
 
         let block = provider.get_block_number().await.unwrap_or(0);
 
@@ -245,12 +256,20 @@ impl DexMonitor {
             let tx_hash      = log.transaction_hash.unwrap_or_default();
             let data         = log.data();
 
+            // FIX: Sync event Uniswap V2 = 2 × uint112 = 2 × 32 bytes ABI-encoded
             if data.data.len() < 64 {
+                debug!("Data log terlalu pendek ({} bytes) dari {pool_address}", data.data.len());
                 continue;
             }
 
             let reserve0 = U256::from_be_slice(&data.data[0..32]);
             let reserve1 = U256::from_be_slice(&data.data[32..64]);
+
+            // FIX: Skip jika salah satu reserve = 0 (pool dikeringkan / tidak valid)
+            if reserve0.is_zero() || reserve1.is_zero() {
+                debug!("Reserve nol dari {pool_address}, skip");
+                continue;
+            }
 
             let updated = self.pool_registry
                 .update_reserves(pool_address, reserve0, reserve1, block_number);

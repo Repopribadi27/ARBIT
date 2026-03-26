@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
 
     let cfg      = BotConfig::from_env()?;
     let tg_cfg   = TelegramConfig::from_env();
-    let tg       = TelegramNotifier::new(tg_cfg);
+    let tg       = Arc::new(TelegramNotifier::new(tg_cfg));
 
     print_banner(&cfg);
 
