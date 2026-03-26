@@ -5,7 +5,7 @@ use crate::types::{
 };
 use alloy::{
     network::TransactionBuilder,
-    primitives::{Address, U256},
+    primitives::{Address, B256, U256, b256},
     providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
     network::EthereumWallet,
@@ -15,10 +15,15 @@ use alloy::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashSet; // FIX: Import HashSet untuk approval cache
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+// keccak256("ArbitrageExecuted(address,uint256,uint256,uint256,uint256)")
+const ARBITRAGE_EXECUTED_TOPIC: B256 =
+    b256!("6d2ec2e5609e8a523b5a0c5c67748bb6d0a1b0d52e34e6dbc65b0d5a29b8e5f9");
 
 // ── Contract ABI ──────────────────────────────────────────────────────────────
 
@@ -40,6 +45,12 @@ sol! {
             uint256 deadline
         ) external returns (uint256 profit);
     }
+
+    #[sol(rpc)]
+    interface IERC20 {
+        function approve(address spender, uint256 amount) external returns (bool);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
 }
 
 // ── Execution Params ──────────────────────────────────────────────────────────
@@ -60,6 +71,10 @@ pub struct TradeExecutor {
     simulation_mode:  bool,
     metrics:          Arc<Mutex<BotMetrics>>,
     tg:               Arc<TelegramNotifier>,
+    // FIX: Cache in-memory token yang sudah di-approve U256::MAX ke contract.
+    // Ini mencegah bot mengirim approve ulang setiap siklus dan membakar gas.
+    // Cache direset hanya jika bot restart (intentional — U256::MAX tidak expire).
+    approved_tokens:  Arc<Mutex<HashSet<Address>>>,
 }
 
 impl TradeExecutor {
@@ -71,7 +86,15 @@ impl TradeExecutor {
         metrics:          Arc<Mutex<BotMetrics>>,
         tg:               Arc<TelegramNotifier>,
     ) -> Self {
-        Self { contract_address, provider_url, private_key, simulation_mode, metrics, tg }
+        Self {
+            contract_address,
+            provider_url,
+            private_key,
+            simulation_mode,
+            metrics,
+            tg,
+            approved_tokens: Arc::new(Mutex::new(HashSet::new())), // FIX: init cache
+        }
     }
 
     pub async fn execute(&self, params: ExecutionParams) -> TradeResult {
@@ -90,7 +113,6 @@ impl TradeExecutor {
             self.live_execution(&params, trade_id).await
         };
 
-        // Update metrics
         {
             let mut m = self.metrics.lock().await;
             m.total_trades_executed += 1;
@@ -107,9 +129,7 @@ impl TradeExecutor {
             m.update_derived();
         }
 
-        // Kirim notifikasi Telegram berdasarkan hasil
         self.notify_result(&result, mode).await;
-
         result
     }
 
@@ -119,20 +139,14 @@ impl TradeExecutor {
                 let gas_cost = result.gas_used.unwrap_or(220_000) as f64
                     * result.gas_price_gwei.unwrap_or(50.0)
                     * 1e-9
-                    * 0.80; // MATIC price approx
+                    * 0.80;
                 self.tg.send_md(&TelegramMsg::trade_success(
-                    tx_hash,
-                    *actual_profit_usd,
-                    gas_cost,
-                    *block,
-                    mode,
+                    tx_hash, *actual_profit_usd, gas_cost, *block, mode,
                 )).await;
             }
             ExecutionStatus::Reverted { reason, .. } => {
                 let input_usd = result.route.optimal_input.to::<u128>() as f64 / 1e6;
-                self.tg.send_md(&TelegramMsg::trade_reverted(
-                    reason, input_usd, mode
-                )).await;
+                self.tg.send_md(&TelegramMsg::trade_reverted(reason, input_usd, mode)).await;
             }
             ExecutionStatus::Failed { reason } => {
                 self.tg.send_md(&TelegramMsg::trade_failed(reason)).await;
@@ -161,12 +175,9 @@ impl TradeExecutor {
             .with_from(Address::ZERO);
 
         match provider.call(&tx).await {
-            Ok(output) => {
-                let profit = if output.len() >= 32 {
-                    U256::from_be_slice(&output[..32]).to::<u128>() as f64 / 1e6
-                } else { 0.0 };
-
-                info!("[SIM] Trade {trade_id} SUKSES profit ${:.4}", profit);
+            Ok(_output) => {
+                let profit = params.route.net_profit_usd;
+                info!("[SIM] Trade {trade_id} SUKSES profit est. ${:.4}", profit);
                 TradeResult {
                     id: trade_id,
                     route: params.route.clone(),
@@ -209,8 +220,11 @@ impl TradeExecutor {
             Err(e) => return self.failed_result(trade_id, params, format!("Bad key: {e}")),
         };
 
-        let wallet   = EthereumWallet::from(signer);
+        let wallet_address = signer.address();
+        let wallet         = EthereumWallet::from(signer);
+
         let provider = match ProviderBuilder::new()
+            .with_recommended_fillers()
             .wallet(wallet)
             .on_builtin(&self.provider_url).await
         {
@@ -218,13 +232,82 @@ impl TradeExecutor {
             Err(e) => return self.failed_result(trade_id, params, format!("Provider: {e}")),
         };
 
-        let gas_price_wei = (params.gas_price_gwei * 1e9) as u128;
-        let calldata      = self.encode_calldata(params);
+        // ── FIX: Approve dengan cache — hanya approve sekali seumur bot ────────
+        // Root cause bug lama: setiap execute() cek allowance on-chain → jika tx
+        // approve belum di-mine (masih pending), cek berikutnya tetap return 0
+        // sehingga loop approve terus terjadi tanpa henti.
+        //
+        // Solusi: cache in-memory `approved_tokens`. Kalau token sudah ada
+        // di cache → skip approve sama sekali, langsung eksekusi swap.
+        // Cache hanya hilang saat bot restart, yang aman karena kita approve
+        // U256::MAX (infinite approval).
+        let start_token   = params.route.start_token;
+        let amount_needed = params.route.optimal_input;
+
+        let already_approved = {
+            self.approved_tokens.lock().await.contains(&start_token)
+        };
+
+        if !already_approved {
+            // Cek allowance on-chain hanya jika belum ada di cache
+            let token = IERC20::new(start_token, &provider);
+
+            let current_allowance = match token
+                .allowance(wallet_address, self.contract_address)
+                .call().await
+            {
+                Ok(a)  => a._0,
+                Err(e) => return self.failed_result(
+                    trade_id, params, format!("Allowance check gagal: {e}")
+                ),
+            };
+
+            if current_allowance < amount_needed {
+                info!("[LIVE] Approve {start_token} untuk contract…");
+
+                let approve_tx = TransactionRequest::default()
+                    .with_to(start_token)
+                    .with_input(
+                        IERC20::approveCall {
+                            spender: self.contract_address,
+                            amount:  U256::MAX,
+                        }.abi_encode()
+                    );
+
+                match provider.send_transaction(approve_tx).await {
+                    Ok(pending) => match pending.get_receipt().await {
+                        Ok(r) if r.status() => {
+                            info!("[LIVE] Approve OK untuk {start_token}");
+                            // FIX: Tandai sebagai sudah di-approve di cache
+                            self.approved_tokens.lock().await.insert(start_token);
+                        }
+                        Ok(_) => return self.failed_result(
+                            trade_id, params, "Approve tx reverted".to_string()
+                        ),
+                        Err(e) => return self.failed_result(
+                            trade_id, params, format!("Approve receipt: {e}")
+                        ),
+                    },
+                    Err(e) => return self.failed_result(
+                        trade_id, params, format!("Kirim approve gagal: {e}")
+                    ),
+                }
+            } else {
+                // Allowance sudah cukup dari sebelumnya (mungkin dari sesi lalu),
+                // tambahkan ke cache supaya tidak cek on-chain lagi.
+                info!("[LIVE] Allowance {start_token} sudah cukup, cache di-update");
+                self.approved_tokens.lock().await.insert(start_token);
+            }
+        } else {
+            info!("[LIVE] {start_token} sudah di-approve (dari cache), skip approve");
+        }
+        // ── AKHIR FIX APPROVE ─────────────────────────────────────────────────
+
+        let calldata = self.encode_calldata(params);
 
         let tx = TransactionRequest::default()
             .with_to(self.contract_address)
-            .with_input(calldata)
-            .with_gas_price(gas_price_wei);
+            .with_input(calldata);
 
         match provider.send_transaction(tx).await {
             Ok(pending) => {
@@ -237,14 +320,61 @@ impl TradeExecutor {
                         let gas_used = Some(receipt.gas_used as u64);
 
                         if receipt.status() {
-                            info!("[LIVE] Confirmed di block {block}");
+                            // FIX: effective_gas_price adalah u128, bukan Option<u128>
+                            let gas_price_wei = receipt.effective_gas_price as f64;
+
+                            let actual_profit_usd = receipt
+                                .inner
+                                .logs()
+                                .iter()
+                                .find(|log| {
+                                    log.topics()
+                                        .first()
+                                        .map(|t| *t == ARBITRAGE_EXECUTED_TOPIC)
+                                        .unwrap_or(false)
+                                })
+                                .and_then(|log| {
+                                    let data = &log.data().data;
+                                    if data.len() >= 64 {
+                                        let profit_raw = U256::from_be_slice(&data[32..64]);
+                                        let gas_cost = receipt.gas_used as f64
+                                            * gas_price_wei
+                                            * 1e-18
+                                            * 0.40;
+                                        let ratio = if params.route.optimal_input > U256::ZERO {
+                                            profit_raw.to::<u128>() as f64
+                                                / params.route.optimal_input.to::<u128>() as f64
+                                        } else { 0.0 };
+                                        let profit_usd = ratio * params.route.profit_usd
+                                            / (params.route.profit_usd
+                                                - params.route.gas_cost_usd)
+                                                .max(0.001)
+                                            * params.route.profit_usd;
+                                        Some((profit_usd - gas_cost).max(0.0))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    let gas_cost = receipt.gas_used as f64
+                                        * gas_price_wei
+                                        * 1e-18
+                                        * 0.40;
+                                    (params.route.net_profit_usd - gas_cost).max(0.0)
+                                });
+
+                            info!(
+                                "[LIVE] Confirmed block {block} | gas: {} | profit: ${:.4}",
+                                receipt.gas_used, actual_profit_usd
+                            );
+
                             TradeResult {
                                 id: trade_id,
                                 route: params.route.clone(),
                                 status: ExecutionStatus::Confirmed {
                                     tx_hash,
                                     block,
-                                    actual_profit_usd: params.route.net_profit_usd,
+                                    actual_profit_usd,
                                 },
                                 gas_used,
                                 gas_price_gwei: Some(params.gas_price_gwei),
@@ -275,16 +405,13 @@ impl TradeExecutor {
     }
 
     fn encode_calldata(&self, params: &ExecutionParams) -> Vec<u8> {
-        // Konversi fee dari bps ke Uniswap fee unit (bps * 10 = fee ppm)
-        // V2: 30 bps = 300 fee units (0.3%)
-        // V3: 5 bps = 500, 30 bps = 3000, 100 bps = 10000
         let steps: Vec<IArbitrageExecutor::SwapStep> = params.route.steps.iter()
             .map(|s| {
                 let fee_val = match s.fee_tier {
-                    crate::types::FeeTier::V2_30  => 3000u32,  // 0.3%
-                    crate::types::FeeTier::V3_5   => 500u32,   // 0.05%
-                    crate::types::FeeTier::V3_30  => 3000u32,  // 0.3%
-                    crate::types::FeeTier::V3_100 => 10000u32, // 1%
+                    crate::types::FeeTier::V2_30  => 3000u32,
+                    crate::types::FeeTier::V3_5   =>  500u32,
+                    crate::types::FeeTier::V3_30  => 3000u32,
+                    crate::types::FeeTier::V3_100 => 10000u32,
                 };
                 IArbitrageExecutor::SwapStep {
                     pool:     s.pool_address,
@@ -341,7 +468,6 @@ impl TradeLogger {
 
     pub async fn log_trade(&self, result: &TradeResult) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        // Buat parent dir jika belum ada
         if let Some(parent) = std::path::Path::new(&self.log_path).parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
@@ -369,7 +495,8 @@ impl TradeLogger {
             }
         }
         if stats.total_trades > 0 {
-            stats.success_rate = stats.successful as f64 / stats.total_trades as f64 * 100.0;
+            stats.success_rate =
+                stats.successful as f64 / stats.total_trades as f64 * 100.0;
         }
         Ok(stats)
     }

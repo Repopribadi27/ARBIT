@@ -6,19 +6,12 @@ pragma solidity ^0.8.24;
  * @author MEV Bot (Educational Purpose)
  * @notice Kontrak eksekusi arbitrase multi-hop yang atomic.
  *
- * @dev Fitur utama:
- *   1. Eksekusi multi-hop swap (V2 dan V3) dalam satu transaksi
- *   2. Automatic revert jika profit < minProfit (kapital aman)
- *   3. Deadline protection untuk mencegah frontrun
- *   4. Re-entrancy guard
- *   5. Owner-only withdrawal
- *
- * Alur eksekusi:
- *   1. Transfer tokenIn dari owner ke contract
- *   2. Execute setiap SwapStep secara berurutan
- *   3. Hitung profit akhir
- *   4. Jika profit < minProfit → REVERT seluruh transaksi
- *   5. Jika OK → transfer profit ke owner
+ * CHANGELOG v2:
+ *   BUG FIX #4 — uniswapV3SwapCallback tidak memvalidasi msg.sender.
+ *     Siapapun bisa memanggil callback dan menguras token dari contract.
+ *     Fix: tambah state variable `_activeV3Pool` yang di-set sebelum
+ *     pool.swap() dipanggil, dan di-reset sesudahnya. Callback hanya
+ *     boleh dipanggil oleh pool yang sedang aktif.
  */
 
 interface IERC20 {
@@ -69,6 +62,11 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
     address public immutable owner;
     bool    private _locked;
 
+    // BUG FIX #4: Simpan alamat V3 pool yang sedang aktif.
+    // Di-set tepat sebelum pool.swap() dipanggil, di-reset sesudahnya.
+    // Callback hanya boleh dipanggil oleh alamat ini.
+    address private _activeV3Pool;
+
     // ── Events ─────────────────────────────────────────────────────────────────
 
     event ArbitrageExecuted(
@@ -89,11 +87,11 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
     // ── Structs ────────────────────────────────────────────────────────────────
 
     struct SwapStep {
-        address pool;      // Alamat pool (V2 pair atau V3 pool)
-        address tokenIn;   // Token yang masuk ke pool
-        address tokenOut;  // Token yang keluar dari pool
-        uint24  fee;       // Fee tier (hanya relevan untuk V3: 500, 3000, 10000)
-        bool    isV3;      // true = UniswapV3, false = UniswapV2
+        address pool;
+        address tokenIn;
+        address tokenOut;
+        uint24  fee;
+        bool    isV3;
     }
 
     struct V3CallbackData {
@@ -128,20 +126,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
     // ── Main Execution ─────────────────────────────────────────────────────────
 
-    /**
-     * @notice Eksekusi arbitrase multi-hop secara atomic.
-     *
-     * @dev Jika profit akhir < minProfit, seluruh transaksi REVERT.
-     *      Ini menjamin bahwa modal tidak pernah berkurang dari eksekusi
-     *      yang tidak menguntungkan.
-     *
-     * @param steps     Array langkah swap yang membentuk siklus arbitrase
-     * @param amountIn  Jumlah token awal yang diinput
-     * @param minProfit Minimum profit yang harus diperoleh (dalam token awal)
-     * @param deadline  Unix timestamp batas waktu eksekusi
-     *
-     * @return profit   Jumlah profit yang diperoleh (token awal)
-     */
     function executeArbitrage(
         SwapStep[] calldata steps,
         uint256 amountIn,
@@ -160,11 +144,9 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
             "Must return to start token (not a cycle)"
         );
 
-        // Catat saldo awal sebelum eksekusi
-        address startToken      = steps[0].tokenIn;
-        uint256 balanceBefore   = IERC20(startToken).balanceOf(address(this));
+        address startToken    = steps[0].tokenIn;
+        uint256 balanceBefore = IERC20(startToken).balanceOf(address(this));
 
-        // Transfer token dari caller ke contract jika perlu
         if (balanceBefore < amountIn) {
             uint256 needed = amountIn - balanceBefore;
             require(
@@ -173,9 +155,7 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
             );
         }
 
-        uint256 gasStart = gasleft();
-
-        // ── Execute semua swap steps ──────────────────────────────────────────
+        uint256 gasStart    = gasleft();
         uint256 currentAmount = amountIn;
 
         for (uint256 i = 0; i < steps.length; i++) {
@@ -187,21 +167,14 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
                 currentAmount = _swapV2(step, currentAmount);
             }
 
-            // Safety check: amount tidak boleh nol setelah setiap hop
             require(currentAmount > 0, "Zero amount after swap step");
         }
 
-        // ── Profit Check ──────────────────────────────────────────────────────
-
-        uint256 balanceAfter = IERC20(startToken).balanceOf(address(this));
-
-        // Hitung profit berdasarkan perubahan saldo (lebih akurat dari kalkulasi)
+        uint256 balanceAfter  = IERC20(startToken).balanceOf(address(this));
         uint256 totalReceived = balanceAfter > balanceBefore
             ? balanceAfter - balanceBefore
             : 0;
 
-        // Jika profit kurang dari minimum yang diharapkan → REVERT
-        // Ini melindungi modal dari eksekusi yang tidak menguntungkan
         require(
             totalReceived >= amountIn + minProfit,
             "Insufficient profit: trade not profitable enough"
@@ -209,7 +182,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
         profit = totalReceived - amountIn;
 
-        // ── Transfer profit ke owner ───────────────────────────────────────────
         require(
             IERC20(startToken).transfer(owner, amountIn + profit),
             "Transfer to owner failed"
@@ -228,39 +200,28 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
     // ── V2 Swap ────────────────────────────────────────────────────────────────
 
-    /**
-     * @dev Execute satu swap di Uniswap V2 compatible pool.
-     *
-     * Formula output: amountOut = (amountIn * 997 * reserveOut)
-     *                           / (reserveIn * 1000 + amountIn * 997)
-     */
     function _swapV2(
         SwapStep calldata step,
         uint256 amountIn
     ) internal returns (uint256 amountOut) {
         IUniswapV2Pair pair = IUniswapV2Pair(step.pool);
 
-        // Tentukan urutan token (token0 atau token1)
-        address token0 = pair.token0();
+        address token0     = pair.token0();
         bool    zeroForOne = (step.tokenIn == token0);
 
-        // Fetch reserves
         (uint112 reserve0, uint112 reserve1,) = pair.getReserves();
         (uint256 reserveIn, uint256 reserveOut) = zeroForOne
             ? (uint256(reserve0), uint256(reserve1))
             : (uint256(reserve1), uint256(reserve0));
 
-        // Hitung output dengan formula AMM
         amountOut = _getAmountOutV2(amountIn, reserveIn, reserveOut);
         require(amountOut > 0, "V2: insufficient output amount");
 
-        // Transfer token ke pool
         require(
             IERC20(step.tokenIn).transfer(step.pool, amountIn),
             "V2: token transfer to pool failed"
         );
 
-        // Execute swap: set amount0Out atau amount1Out
         (uint256 amount0Out, uint256 amount1Out) = zeroForOne
             ? (uint256(0), amountOut)
             : (amountOut, uint256(0));
@@ -268,9 +229,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
         pair.swap(amount0Out, amount1Out, address(this), "");
     }
 
-    /**
-     * @dev Implementasi formula AMM V2: x * y = k
-     */
     function _getAmountOutV2(
         uint256 amountIn,
         uint256 reserveIn,
@@ -288,68 +246,73 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
     // ── V3 Swap ────────────────────────────────────────────────────────────────
 
-    /**
-     * @dev Execute satu swap di Uniswap V3 pool.
-     *
-     * Menggunakan sqrtPriceLimitX96 = 0 (no price limit, tapi ada slippage
-     * protection dari minProfit check di akhir).
-     */
     function _swapV3(
         SwapStep calldata step,
         uint256 amountIn
     ) internal returns (uint256 amountOut) {
         IUniswapV3Pool pool = IUniswapV3Pool(step.pool);
 
-        // Tentukan arah swap
         bool zeroForOne = step.tokenIn < step.tokenOut;
 
-        // sqrtPriceLimitX96: batas harga
-        // MIN_SQRT_RATIO + 1 untuk zeroForOne, MAX_SQRT_RATIO - 1 untuk sebaliknya
         uint160 sqrtPriceLimitX96 = zeroForOne
-            ? 4295128739 + 1           // MIN_SQRT_RATIO + 1
-            : 1461446703485210103287273052203988822378723970342 - 1; // MAX_SQRT_RATIO - 1
+            ? 4295128739 + 1
+            : 1461446703485210103287273052203988822378723970342 - 1;
 
         bytes memory callbackData = abi.encode(V3CallbackData({
             tokenIn: step.tokenIn,
             payer:   address(this)
         }));
 
+        // BUG FIX #4: Catat pool yang sedang aktif SEBELUM memanggil swap.
+        // Ini memastikan callback hanya bisa dipanggil oleh pool ini,
+        // bukan oleh address lain yang mencoba menguras token contract.
+        _activeV3Pool = step.pool;
+
         (int256 amount0Delta, int256 amount1Delta) = pool.swap(
-            address(this),      // recipient
+            address(this),
             zeroForOne,
-            int256(amountIn),   // positive = exact input
+            int256(amountIn),
             sqrtPriceLimitX96,
             callbackData
         );
 
-        // Output adalah nilai negatif dari delta yang berlawanan
+        // Reset setelah swap selesai untuk mencegah replay attack.
+        _activeV3Pool = address(0);
+
         amountOut = zeroForOne
             ? uint256(-amount1Delta)
             : uint256(-amount0Delta);
     }
 
     /**
-     * @dev Callback dari Uniswap V3 untuk transfer token saat swap.
+     * @dev Callback dari Uniswap V3.
      *
-     * V3 menggunakan "pull" pattern: pool memanggil callback,
-     * dan kita harus transfer token di sini.
+     * BUG FIX #4: Tambah validasi msg.sender == _activeV3Pool.
+     * Tanpa validasi ini, siapapun bisa memanggil fungsi ini secara
+     * langsung dan memerintahkan contract untuk transfer token ke
+     * alamat sembarang — ini adalah vulnerability drain klasik di
+     * kontrak DEX callback.
      */
     function uniswapV3SwapCallback(
         int256 amount0Delta,
         int256 amount1Delta,
         bytes calldata data
     ) external override {
-        // Decode callback data
+        // SECURITY: Hanya pool yang sedang aktif yang boleh memanggil callback ini.
+        require(
+            msg.sender == _activeV3Pool,
+            "V3 Callback: unauthorized caller"
+        );
+        require(_activeV3Pool != address(0), "V3 Callback: no active pool");
+
         V3CallbackData memory cbData = abi.decode(data, (V3CallbackData));
 
-        // Tentukan berapa yang harus kita bayar
         uint256 amountToPay = amount0Delta > 0
             ? uint256(amount0Delta)
             : uint256(amount1Delta);
 
         require(amountToPay > 0, "V3 Callback: nothing to pay");
 
-        // Transfer token ke pool (yang sedang melakukan callback)
         require(
             IERC20(cbData.tokenIn).transfer(msg.sender, amountToPay),
             "V3 Callback: transfer failed"
@@ -358,10 +321,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
     // ── Admin Functions ────────────────────────────────────────────────────────
 
-    /**
-     * @notice Withdraw token dari contract ke owner.
-     * @dev Hanya dipanggil dalam kondisi darurat atau setelah profit terkumpul.
-     */
     function withdrawToken(address token, uint256 amount) external onlyOwner {
         if (amount == 0) {
             amount = IERC20(token).balanceOf(address(this));
@@ -372,9 +331,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
         );
     }
 
-    /**
-     * @notice Withdraw native MATIC dari contract.
-     */
     function withdrawMatic() external onlyOwner {
         uint256 balance = address(this).balance;
         require(balance > 0, "No MATIC to withdraw");
@@ -382,11 +338,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
         require(success, "Transfer MATIC gagal");
     }
 
-    /**
-     * @notice Batch approve tokens untuk pools (gas optimization).
-     * @dev Approve max uint256 untuk semua token × pools yang akan digunakan.
-     *      Dipanggil sekali setelah deploy, bukan per transaksi.
-     */
     function approveTokens(
         address[] calldata tokens,
         address[] calldata spenders
@@ -400,10 +351,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
     // ── View Functions ─────────────────────────────────────────────────────────
 
-    /**
-     * @notice Simulasikan arbitrase tanpa state change (eth_call only).
-     * @dev Berguna untuk off-chain profit check sebelum submit tx.
-     */
     function simulateArbitrage(
         SwapStep[] calldata steps,
         uint256 amountIn
@@ -423,7 +370,6 @@ contract ArbitrageExecutor is IUniswapV3SwapCallback {
 
                 currentAmount = _getAmountOutV2(currentAmount, rIn, rOut);
             }
-            // V3 simulation lebih kompleks - skip untuk view function
         }
 
         estimatedProfit = currentAmount > amountIn

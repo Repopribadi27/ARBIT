@@ -15,7 +15,7 @@ use monitor::{DexMonitor, PoolRegistry};
 use telegram::{TelegramConfig, TelegramMsg, TelegramNotifier};
 use types::{BotMetrics, DexType, FeeTier, SyncEvent};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -38,23 +38,23 @@ fn init_logging() {
 
 fn token_names(cfg: &BotConfig) -> HashMap<Address, &'static str> {
     let mut m = HashMap::new();
-    m.insert(cfg.tokens.wmatic, "WMATIC");
-    m.insert(cfg.tokens.weth,   "WETH");
-    m.insert(cfg.tokens.usdc,   "USDC");
-    m.insert(cfg.tokens.usdt,   "USDT");
-    m.insert(cfg.tokens.dai,    "DAI");
-    m.insert(cfg.tokens.wbtc,   "WBTC");
+    m.insert(cfg.tokens.wmatic,  "WMATIC");
+    m.insert(cfg.tokens.weth,    "WETH");
+    m.insert(cfg.tokens.usdc,    "USDC");
+    m.insert(cfg.tokens.usdt,    "USDT");
+    m.insert(cfg.tokens.link,    "LINK");
+    m.insert(cfg.tokens.maticx,  "MATICx");
     m
 }
 
 fn token_decimals(cfg: &BotConfig) -> HashMap<Address, u8> {
     let mut m = HashMap::new();
-    m.insert(cfg.tokens.wmatic, 18u8);
-    m.insert(cfg.tokens.weth,   18u8);
-    m.insert(cfg.tokens.usdc,    6u8);
-    m.insert(cfg.tokens.usdt,    6u8);
-    m.insert(cfg.tokens.dai,    18u8);
-    m.insert(cfg.tokens.wbtc,    8u8);
+    m.insert(cfg.tokens.wmatic,  18u8);
+    m.insert(cfg.tokens.weth,    18u8);
+    m.insert(cfg.tokens.usdc,     6u8);
+    m.insert(cfg.tokens.usdt,     6u8);
+    m.insert(cfg.tokens.link,    18u8);
+    m.insert(cfg.tokens.maticx,  18u8);
     m
 }
 
@@ -62,7 +62,6 @@ fn token_decimals(cfg: &BotConfig) -> HashMap<Address, u8> {
 async fn main() -> Result<()> {
     init_logging();
 
-    // Buat direktori logs jika belum ada
     tokio::fs::create_dir_all("logs").await.ok();
 
     let cfg      = BotConfig::from_env()?;
@@ -71,7 +70,6 @@ async fn main() -> Result<()> {
 
     print_banner(&cfg);
 
-    // Kirim notifikasi startup
     let mode_str = if cfg.simulation.is_simulation { "SIMULASI" } else { "LIVE" };
     tg.send_md(&TelegramMsg::startup(
         mode_str,
@@ -118,10 +116,13 @@ async fn main() -> Result<()> {
 
     let logger = Arc::new(TradeLogger::new("logs/trades.jsonl".to_string()));
 
-    // ── Factories ─────────────────────────────────────────────────────────────
     let factories = vec![
         (cfg.dex.quickswap_v2_factory, DexType::UniswapV2, FeeTier::V2_30),
         (cfg.dex.sushiswap_factory,    DexType::UniswapV2, FeeTier::V2_30),
+        (cfg.dex.apeswap_factory,      DexType::UniswapV2, FeeTier::V2_30),
+        (cfg.dex.dfyn_factory,         DexType::UniswapV2, FeeTier::V2_30),
+        (cfg.dex.uniswap_v3_factory,   DexType::UniswapV3, FeeTier::V3_30),
+        (cfg.dex.quickswap_v3_factory, DexType::UniswapV3, FeeTier::V3_30),
     ];
 
     // ── Monitor ───────────────────────────────────────────────────────────────
@@ -148,7 +149,6 @@ async fn main() -> Result<()> {
     let monitor_task = {
         let monitor = monitor.clone();
         let tg      = tg.clone();
-        let ws_url2 = ws_url.clone();
         tokio::spawn(async move {
             let mut retry   = 0u32;
             let mut backoff = 2u64;
@@ -185,7 +185,6 @@ async fn main() -> Result<()> {
     let scan_ms  = cfg.strategy.scan_interval_ms;
     let min_pnl  = cfg.strategy.min_profit_usd;
     let max_hops = cfg.strategy.max_hops;
-    let is_sim   = cfg.simulation.is_simulation;
 
     let detect_task = {
         let detector  = detector.clone();
@@ -193,15 +192,13 @@ async fn main() -> Result<()> {
         let logger    = logger.clone();
         let metrics   = metrics.clone();
         let tg        = tg.clone();
-        // Clone names untuk dipakai di dalam closure
         let names_arc: Arc<HashMap<Address, &'static str>> = Arc::new(names);
 
         tokio::spawn(async move {
-            let mut block: u64        = 0;
-            let mut last_scan         = Instant::now();
-            let mut last_exec         = Instant::now();
-            // Anti-spam: jangan eksekusi lebih dari 1 trade per 5 detik
-            let exec_cooldown = Duration::from_secs(5);
+            let mut block: u64 = 0;
+            let mut last_scan  = Instant::now();
+            let mut last_exec  = Instant::now();
+            let exec_cooldown  = Duration::from_secs(5);
 
             while let Some(_ev) = event_rx.recv().await {
                 let now = Instant::now();
@@ -216,27 +213,45 @@ async fn main() -> Result<()> {
                 info!("{} siklus terdeteksi di block {}", cycles.len(), block);
 
                 for cycle in &cycles {
-                    let profit_pct = (-cycle.total_log_weight).exp() - 1.0;
-                    // Estimasi profit dalam USD berdasarkan persentase dari max input
-                    let profit_est = profit_pct
-                        * max_input_raw.to::<u128>() as f64
-                        / 1e6  // USDC 6 decimals
-                        * 0.10; // gunakan 10% max input sebagai input awal estimasi
+                    // ── FIX: Hitung profit dan expected_profit secara akurat ──
+                    // total_log_weight adalah negatif untuk siklus profitable.
+                    // exp(-w) - 1 memberikan rasio profit (misal 0.005 = 0.5%).
+                    let profit_ratio = (-cycle.total_log_weight).exp() - 1.0;
 
-                    if profit_est < min_pnl { continue; }
+                    // Gunakan 10% dari max_input sebagai input estimasi
+                    let input_fraction = max_input_raw
+                        * U256::from(10u64)
+                        / U256::from(100u64);
 
-                    // Update opportunities counter
+                    // FIX: Hitung expected_profit dalam raw token units (USDC = 6 dec)
+                    // profit_ratio * input → jumlah token profit yang diharapkan
+                    let expected_profit_raw = {
+                        let input_u128 = input_fraction.to::<u128>();
+                        let profit_u128 = (profit_ratio * input_u128 as f64) as u128;
+                        U256::from(profit_u128)
+                    };
+
+                    // Konversi ke USD untuk perbandingan threshold (USDC 6 desimal)
+                    let profit_est = expected_profit_raw.to::<u128>() as f64 / 1e6;
+
+                    if profit_est < min_pnl {
+                        continue;
+                    }
+
                     {
                         let mut m = metrics.lock().await;
                         m.total_opportunities_found += 1;
                     }
 
                     info!(
-                        "Peluang: profit est ${:.4} | log_w {:.6} | hops {}",
-                        profit_est, cycle.total_log_weight, cycle.edges.len()
+                        "Peluang: profit est ${:.4} ({:.3}%) | log_w {:.6} | hops {}",
+                        profit_est,
+                        profit_ratio * 100.0,
+                        cycle.total_log_weight,
+                        cycle.edges.len()
                     );
 
-                    // Build route string dari cycle edges untuk Telegram
+                    // Build route string untuk Telegram
                     let route_str: String = {
                         let mut parts = Vec::new();
                         if let Some(first) = cycle.edges.first() {
@@ -252,23 +267,20 @@ async fn main() -> Result<()> {
                         parts.join(" -> ")
                     };
 
-                    // Kirim notifikasi peluang ke Telegram
                     tg.send_md(&TelegramMsg::opportunity_found(
                         &route_str,
                         profit_est,
-                        max_input_raw.to::<u128>() as f64 / 1e6 * 0.10,
+                        input_fraction.to::<u128>() as f64 / 1e6,
                         cycle.edges.len(),
                         block,
                     )).await;
 
                     // ── EKSEKUSI TRADE ─────────────────────────────────────────
-                    // Cek cooldown
                     if now.duration_since(last_exec) < exec_cooldown {
                         info!("Cooldown aktif, skip eksekusi");
                         continue;
                     }
 
-                    // Build RouteSteps dari cycle edges
                     use types::RouteStep;
                     let steps: Vec<RouteStep> = cycle.edges.iter()
                         .map(|e| RouteStep {
@@ -286,26 +298,33 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Build ArbitrageRoute minimal
                     use types::ArbitrageRoute;
                     use uuid::Uuid;
-                    use alloy::primitives::U256;
 
                     let start_token = steps[0].token_in;
-                    let input_raw   = max_input_raw
-                        * U256::from(10u64)
-                        / U256::from(100u64); // 10% dari max input
+
+                    // FIX: Hitung expected_output = input + profit yang diharapkan
+                    let expected_output = input_fraction
+                        .saturating_add(expected_profit_raw);
+
+                    // Gas cost estimasi: 200k gas × 50 Gwei × harga MATIC ~$0.80
+                    // 200_000 × 50e-9 × 0.80 ≈ $0.008
+                    let gas_cost_usd = 0.008_f64 * cycle.edges.len() as f64;
+
+                    let net_profit_usd = (profit_est - gas_cost_usd).max(0.0);
 
                     let route = ArbitrageRoute {
                         id:              Uuid::new_v4(),
                         start_token,
                         steps,
-                        optimal_input:   input_raw,
-                        expected_output: input_raw, // akan divalidasi di contract
-                        expected_profit: U256::ZERO,
+                        optimal_input:   input_fraction,
+                        expected_output,
+                        // FIX: expected_profit sekarang dihitung dari cycle weight —
+                        // bukan U256::ZERO yang membuat min_profit check selalu gagal
+                        expected_profit: expected_profit_raw,
                         profit_usd:      profit_est,
-                        gas_cost_usd:    0.009,
-                        net_profit_usd:  profit_est - 0.009,
+                        gas_cost_usd,
+                        net_profit_usd,
                         calculated_at:   Utc::now(),
                         block_number:    block,
                     };
@@ -319,13 +338,12 @@ async fn main() -> Result<()> {
 
                     let result = executor.execute(params).await;
 
-                    // Log trade ke file
                     if let Err(e) = logger.log_trade(&result).await {
                         warn!("Gagal log trade: {e}");
                     }
 
                     last_exec = Instant::now();
-                    break; // Hanya eksekusi satu trade per scan cycle
+                    break; // Satu trade per scan cycle
                 }
 
                 block += 1;
@@ -363,7 +381,6 @@ async fn main() -> Result<()> {
                 let snap = m.clone();
                 drop(m);
 
-                // Kirim laporan ke Telegram setiap 10 menit (20 x 30s)
                 tg_report_count += 1;
                 if tg_report_count % 20 == 0 {
                     let uptime_m = start_time.elapsed().as_secs() / 60;
@@ -413,7 +430,6 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => info!("Ctrl+C - shutdown"),
     }
 
-    // Kirim notifikasi shutdown
     let final_metrics = metrics.lock().await;
     tg.send_md(&TelegramMsg::shutdown(
         final_metrics.net_profit_usd,

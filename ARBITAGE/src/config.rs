@@ -33,27 +33,49 @@ pub struct StrategyConfig {
     pub scan_interval_ms: u64,
 }
 
+// ── TokenConfig ───────────────────────────────────────────────────────────────
+// REMOVED: `dai`  — wide spreads + 18-decimal dust errors at $10 capital
+// REMOVED: `wbtc` — illiquid at micro-scale, high slippage on small DEXes
+// ADDED:   `link` — deep Polygon liquidity; tight spread on QS V2 + Uniswap V3
+// ADDED:   `maticx` — Stader liquid staking; active arb vs WMATIC on QS + Dfyn
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenConfig {
-    pub wmatic: Address,
-    pub weth:   Address,
-    pub usdc:   Address,
-    pub usdt:   Address,
-    pub dai:    Address,
-    pub wbtc:   Address,
+    pub wmatic:  Address,
+    pub weth:    Address,
+    pub usdc:    Address,
+    pub usdt:    Address,
+    pub link:    Address,   // ← NEW (replaces wbtc)
+    pub maticx:  Address,   // ← NEW (replaces dai)
 }
 
 impl TokenConfig {
+    /// Returns only the six high-liquidity tokens used for graph construction.
+    /// Order is intentional: stable pairs first so Bellman-Ford seeds quickly.
     pub fn base_tokens(&self) -> Vec<Address> {
-        vec![self.wmatic, self.weth, self.usdc, self.usdt, self.dai, self.wbtc]
+        vec![
+            self.wmatic,   // native gas token — present in every pair
+            self.usdc,     // deepest stable pool on Polygon
+            self.usdt,     // second-deepest stable; tight USDC↔USDT arb
+            self.weth,     // ETH bridge token — high-volume V2 + V3
+            self.link,     // oracle token; cross-DEX price divergence common
+            self.maticx,   // liquid staking premium creates WMATIC↔MATICx arb
+        ]
     }
 }
 
+// ── DexConfig ─────────────────────────────────────────────────────────────────
+// NEW fields added below the original three:
+//   quickswap_v3_factory — Algebra concentrated liquidity (Polygon-native)
+//   apeswap_factory      — V2-compatible; good WMATIC/USDT TVL
+//   dfyn_factory         — V2-compatible; active MATICx pairs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DexConfig {
-    pub quickswap_v2_factory: Address,
-    pub sushiswap_factory:    Address,
-    pub uniswap_v3_factory:   Address,
+    pub quickswap_v2_factory:  Address,
+    pub sushiswap_factory:     Address,
+    pub uniswap_v3_factory:    Address,  // existed before; now wired into factories vec
+    pub quickswap_v3_factory:  Address,  // ← NEW
+    pub apeswap_factory:       Address,  // ← NEW
+    pub dfyn_factory:          Address,  // ← NEW
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,26 +103,29 @@ impl BotConfig {
                     .unwrap_or(Address::ZERO),
             },
             strategy: StrategyConfig {
-                min_profit_usd:   env_f64("MIN_PROFIT_USD").unwrap_or(0.50),
-                max_input_usd:    env_f64("MAX_INPUT_USD").unwrap_or(5000.0),
+                // Micro-capital defaults mirror .env values; override via env
+                min_profit_usd:   env_f64("MIN_PROFIT_USD").unwrap_or(0.03),
+                max_input_usd:    env_f64("MAX_INPUT_USD").unwrap_or(10.0),
                 max_hops:         env_usize("MAX_HOPS").unwrap_or(3),
-                slippage_bps:     env_u64("SLIPPAGE_BPS").unwrap_or(50),
+                slippage_bps:     env_u64("SLIPPAGE_BPS").unwrap_or(10),
                 gas_multiplier:   env_f64("GAS_MULTIPLIER").unwrap_or(1.15),
                 scan_interval_ms: 100,
             },
             tokens: TokenConfig {
                 wmatic: parse_addr("WMATIC")
                     .unwrap_or_else(|_| "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".parse().unwrap()),
-                weth: parse_addr("WETH")
+                weth:   parse_addr("WETH")
                     .unwrap_or_else(|_| "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619".parse().unwrap()),
-                usdc: parse_addr("USDC")
+                usdc:   parse_addr("USDC")
                     .unwrap_or_else(|_| "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174".parse().unwrap()),
-                usdt: parse_addr("USDT")
+                usdt:   parse_addr("USDT")
                     .unwrap_or_else(|_| "0xc2132D05D31c914a87C6611C10748AEb04B58e8F".parse().unwrap()),
-                dai: parse_addr("DAI")
-                    .unwrap_or_else(|_| "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063".parse().unwrap()),
-                wbtc: parse_addr("WBTC")
-                    .unwrap_or_else(|_| "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6".parse().unwrap()),
+                // LINK — Chainlink on Polygon PoS (18 decimals)
+                link:   parse_addr("LINK")
+                    .unwrap_or_else(|_| "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39".parse().unwrap()),
+                // MATICx — Stader liquid staking token (18 decimals)
+                maticx: parse_addr("MATICX")
+                    .unwrap_or_else(|_| "0xfa68FB4628DFF1028CFEc22b4162FCcd0d45efb6".parse().unwrap()),
             },
             dex: DexConfig {
                 quickswap_v2_factory: parse_addr("QUICKSWAP_V2_FACTORY")
@@ -109,6 +134,15 @@ impl BotConfig {
                     .unwrap_or_else(|_| "0xc35DADB65012eC5796536bD9864eD8773aBc74C4".parse().unwrap()),
                 uniswap_v3_factory: parse_addr("UNISWAP_V3_FACTORY")
                     .unwrap_or_else(|_| "0x1F98431c8aD98523631AE4a59f267346ea31F984".parse().unwrap()),
+                // QuickSwap V3 (Algebra protocol) — Polygon canonical address
+                quickswap_v3_factory: parse_addr("QUICKSWAP_V3_FACTORY")
+                    .unwrap_or_else(|_| "0x411b0fAcC3489691f28ad58c47006AF5E3Ab3A28".parse().unwrap()),
+                // ApeSwap — V2-compatible Polygon factory
+                apeswap_factory: parse_addr("APESWAP_FACTORY")
+                    .unwrap_or_else(|_| "0xCf083Be4164828f00cAE704EC15a36D711491284".parse().unwrap()),
+                // Dfyn — V2-compatible; good MATICx/WMATIC pool
+                dfyn_factory: parse_addr("DFYN_FACTORY")
+                    .unwrap_or_else(|_| "0xE7Fb3e833eFE5F9c441105EB65Ef8b261266423B".parse().unwrap()),
             },
             simulation: SimulationConfig {
                 anvil_rpc_url: env_str("ANVIL_RPC_URL")

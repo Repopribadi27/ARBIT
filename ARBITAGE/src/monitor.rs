@@ -1,5 +1,5 @@
 // src/monitor.rs
-//! Monitor WebSocket real-time untuk event Sync DEX V2.
+//! Monitor WebSocket real-time untuk event Sync (V2) dan Swap (V3).
 
 use crate::graph::ArbitrageGraph;
 use crate::types::{DexType, FeeTier, PoolStateV2, SyncEvent};
@@ -18,9 +18,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-// Sync event topic: keccak256("Sync(uint112,uint112)")
+// V2 — keccak256("Sync(uint112,uint112)")
 const SYNC_TOPIC: B256 =
     b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+
+// V3 — keccak256("Swap(address,address,int256,int256,uint160,uint128,int24)")
+const SWAP_TOPIC_V3: B256 =
+    b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 sol! {
     #[sol(rpc)]
@@ -77,8 +81,7 @@ impl PoolRegistry {
         block_number: u64,
     ) -> bool {
         if let Some(mut pool) = self.pools.get_mut(&pool_address) {
-            // FIX: Skip update jika reserve tidak berubah sama sekali
-            // (menghindari graph update yang tidak perlu)
+            // Skip update jika reserve tidak berubah (hindari graph update tidak perlu)
             if pool.reserve0 == reserve0 && pool.reserve1 == reserve1 {
                 return false;
             }
@@ -146,7 +149,6 @@ impl DexMonitor {
         let pool_count = self.pool_registry.pool_count();
         info!("Total {} pools ditemukan", pool_count);
 
-        // FIX: Jangan lanjut subscribe jika tidak ada pool yang ditemukan
         if pool_count == 0 {
             return Err(anyhow::anyhow!(
                 "Tidak ada pool yang ditemukan! Periksa factory address dan koneksi RPC."
@@ -164,10 +166,22 @@ impl DexMonitor {
         provider: Arc<impl Provider + Clone + 'static>,
     ) -> Result<()> {
         let token_pairs = self.generate_token_pairs();
-        info!("Mengecek {} pasangan di {} DEX...",
-            token_pairs.len(), self.factories.len());
+        info!(
+            "Mengecek {} pasangan di {} DEX...",
+            token_pairs.len(),
+            self.factories.len()
+        );
 
         for (factory_addr, dex_type, fee_tier) in &self.factories {
+            // Lewati factory V3 — butuh getPool() bukan getPair()
+            if *dex_type == DexType::UniswapV3 {
+                debug!(
+                    "Factory V3 {factory_addr} dilewati — \
+                     getPair() tidak tersedia; butuh getPool() untuk V3"
+                );
+                continue;
+            }
+
             let factory = IUniswapV2Factory::new(*factory_addr, provider.clone());
 
             for (token_a, token_b) in &token_pairs {
@@ -179,7 +193,6 @@ impl DexMonitor {
                         }
                         match self.fetch_pool_state(&provider, pair_addr, *dex_type, *fee_tier).await {
                             Ok(pool) => {
-                                // FIX: Hanya register pool jika punya liquiditas cukup
                                 if pool.reserve0 > U256::ZERO && pool.reserve1 > U256::ZERO {
                                     self.graph.update_pool(&pool);
                                     self.pool_registry.register_pool(pool);
@@ -241,31 +254,85 @@ impl DexMonitor {
             return Ok(());
         }
 
-        info!("Subscribe Sync events untuk {} pools", pool_addresses.len());
+        info!("Subscribe Sync(V2) + Swap(V3) events untuk {} pools", pool_addresses.len());
 
+        // Subscribe kedua topic sekaligus, filter alamat dilakukan lokal.
+        // (Alchemy free tier drop filter jika >10 alamat didaftarkan di RPC layer)
         let filter = Filter::new()
-            .event_signature(SYNC_TOPIC)
-            .address(pool_addresses);
+            .event_signature(vec![SYNC_TOPIC, SWAP_TOPIC_V3]);
 
         let sub        = provider.subscribe_logs(&filter).await?;
         let mut stream = sub.into_stream();
 
         while let Some(log) = stream.next().await {
             let pool_address = log.address();
+
+            // Filter lokal — abaikan pool yang tidak kita kenal
+            if !self.pool_registry.pools.contains_key(&pool_address) {
+                continue;
+            }
+
             let block_number = log.block_number.unwrap_or(0);
             let tx_hash      = log.transaction_hash.unwrap_or_default();
             let data         = log.data();
 
-            // FIX: Sync event Uniswap V2 = 2 × uint112 = 2 × 32 bytes ABI-encoded
-            if data.data.len() < 64 {
-                debug!("Data log terlalu pendek ({} bytes) dari {pool_address}", data.data.len());
+            // FIX: Ganti deprecated .topic0() → .topics().first()
+            // .topic0() deprecated di alloy >= 0.9.
+            // .topics() return &[B256] semua topics, .first() ambil topic0.
+            let topic0: B256 = log
+                .topics()
+                .first()
+                .copied()
+                .unwrap_or_default();
+
+            let (reserve0, reserve1) = if topic0 == SYNC_TOPIC {
+                // ── V2 Sync ──────────────────────────────────────────────────
+                // Data: reserve0 (uint112, 32 bytes) | reserve1 (uint112, 32 bytes)
+                if data.data.len() < 64 {
+                    debug!("V2 Sync data pendek ({} bytes) dari {pool_address}", data.data.len());
+                    continue;
+                }
+                let r0 = U256::from_be_slice(&data.data[0..32]);
+                let r1 = U256::from_be_slice(&data.data[32..64]);
+                (r0, r1)
+
+            } else if topic0 == SWAP_TOPIC_V3 {
+                // ── V3 Swap ───────────────────────────────────────────────────
+                // Non-indexed data layout:
+                //   [0..32]    amount0      (int256)
+                //   [32..64]   amount1      (int256)
+                //   [64..96]   sqrtPriceX96 (uint160)
+                //   [96..128]  liquidity    (uint128)
+                //   [128..160] tick         (int24)
+                //
+                // Virtual reserves dari sqrtPriceX96 + liquidity:
+                //   reserve0 = liquidity * 2^96 / sqrtPriceX96
+                //   reserve1 = liquidity * sqrtPriceX96 / 2^96
+                if data.data.len() < 160 {
+                    debug!("V3 Swap data pendek ({} bytes) dari {pool_address}", data.data.len());
+                    continue;
+                }
+                let sqrt_price_x96 = U256::from_be_slice(&data.data[64..96]);
+                let liquidity      = U256::from_be_slice(&data.data[96..128]);
+
+                if sqrt_price_x96.is_zero() || liquidity.is_zero() {
+                    debug!("V3 sqrtPrice/liquidity nol dari {pool_address}, skip");
+                    continue;
+                }
+
+                let q96 = U256::from(1u128) << 96;
+                let r0  = liquidity.saturating_mul(q96)
+                    .checked_div(sqrt_price_x96)
+                    .unwrap_or(U256::ZERO);
+                let r1  = liquidity.saturating_mul(sqrt_price_x96)
+                    .checked_div(q96)
+                    .unwrap_or(U256::ZERO);
+                (r0, r1)
+
+            } else {
                 continue;
-            }
+            };
 
-            let reserve0 = U256::from_be_slice(&data.data[0..32]);
-            let reserve1 = U256::from_be_slice(&data.data[32..64]);
-
-            // FIX: Skip jika salah satu reserve = 0 (pool dikeringkan / tidak valid)
             if reserve0.is_zero() || reserve1.is_zero() {
                 debug!("Reserve nol dari {pool_address}, skip");
                 continue;
