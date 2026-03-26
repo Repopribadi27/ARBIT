@@ -8,50 +8,47 @@ name = "mev-arb-bot"
 path = "src/main.rs"
 
 [dependencies]
-# ── Async Runtime ─────────────────────────────────────────────────────────────
-tokio       = { version = "1", features = ["full"] }
-futures-util = "0.3"
+# --- Async Runtime & Utilities ---
+# Dasar untuk menjalankan bot secara asynchronous
+tokio = { version = "1.36", features = ["full"] }
+futures-util = "0.3.30"
+anyhow = "1.0"
+dotenvy = "0.15"
 
-# ── Blockchain (Alloy 0.9) ────────────────────────────────────────────────────
-alloy = { version = "0.9", features = [
-    "full",
-    "providers",
-    "provider-ws",
-    "transports-ws",
-    "pubsub",
-    "signers",
-    "signer-local",
-    "sol-types",
-    "contract",
-    "rpc-types",
-    "network",
+# --- Blockchain (Alloy v0.9.2) ---
+# NOTE: Sudah dikoreksi menjadi 'transport-ws' (Tanpa 's' di tengah)
+alloy = { version = "0.9.2", features = [
+    "full", 
+    "transport-ws", 
+    "rpc", 
+    "signer-local", 
+    "network"
 ] }
 
-# ── Serde (pinned agar cocok dengan alloy 0.9) ────────────────────────────────
-serde        = { version = "=1.0.210", features = ["derive"] }
-serde_derive = "=1.0.210"
-serde_json   = "=1.0.128"
+# --- Networking (Telegram & API) ---
+# Fitur 'rustls-tls' penting supaya bisa kirim pesan HTTPS ke Telegram
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
-# ── Telegram Notification ─────────────────────────────────────────────────────
-reqwest = { version = "0.12", features = ["json"] }
+# --- Data & Serialization (DIPASTIKAN AMAN) ---
+# Mengunci versi agar tidak ada bentrokan "duplicate lang item"
+serde        = { version = "1.0.210", features = ["derive"] }
+serde_derive = "1.0.210"
+serde_json   = "1.0.128"
+dashmap      = "6.1.0"
+chrono       = { version = "0.4", features = ["serde"] }
+uuid         = { version = "1.7", features = ["v4", "serde"] }
 
-# ── Data structures ───────────────────────────────────────────────────────────
-dashmap = "6"
-
-# ── Error handling ────────────────────────────────────────────────────────────
-anyhow  = "1"
-
-# ── Logging ───────────────────────────────────────────────────────────────────
+# --- Logging & Monitoring ---
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-dotenvy = "0.15"
-chrono  = { version = "0.4", features = ["serde"] }
-uuid    = { version = "1", features = ["v4", "serde"] }
+# --- Graph Theory ---
+petgraph = "0.6"
 
 [profile.release]
-opt-level     = 3
-lto           = "fat"
+# Optimasi performa untuk MEV (Speed is everything!)
+opt-level = 3
+lto = "fat"
 codegen-units = 1
-panic         = "abort"
+panic = "abort"
+strip = true
