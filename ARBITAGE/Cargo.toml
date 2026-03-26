@@ -3,32 +3,55 @@ name = "mev-arb-bot"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "mev-arb-bot"
+path = "src/main.rs"
+
 [dependencies]
-# 1. Core Async & Utilities
-tokio = { version = "1.36", features = ["full"] }
-anyhow = "1.0"
-dotenvy = "0.15"
+# ── Async Runtime ─────────────────────────────────────────────────────────────
+tokio       = { version = "1", features = ["full"] }
+futures-util = "0.3"
 
-# 2. Blockchain Interaction (Alloy)
-alloy = { version = "0.9.2", features = ["full", "transport-ws", "rpc"] }
+# ── Blockchain (Alloy 0.9) ────────────────────────────────────────────────────
+alloy = { version = "0.9", features = [
+    "full",
+    "providers",
+    "provider-ws",
+    "transports-ws",
+    "pubsub",
+    "signers",
+    "signer-local",
+    "sol-types",
+    "contract",
+    "rpc-types",
+    "network",
+] }
 
-# 3. Logika Graph (Otak Arbitrase)
-petgraph = "0.6"
+# ── Serde (pinned agar cocok dengan alloy 0.9) ────────────────────────────────
+serde        = { version = "=1.0.210", features = ["derive"] }
+serde_derive = "=1.0.210"
+serde_json   = "=1.0.128"
 
-# 4. Logging & Tracing
-tracing = "0.1"
+# ── Telegram Notification ─────────────────────────────────────────────────────
+reqwest = { version = "0.12", features = ["json"] }
+
+# ── Data structures ───────────────────────────────────────────────────────────
+dashmap = "6"
+
+# ── Error handling ────────────────────────────────────────────────────────────
+anyhow  = "1"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# 5. Time & Unique IDs
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.7", features = ["v4", "serde"] }
+# ── Utilities ─────────────────────────────────────────────────────────────────
+dotenvy = "0.15"
+chrono  = { version = "0.4", features = ["serde"] }
+uuid    = { version = "1", features = ["v4", "serde"] }
 
-# ==========================================
-# Gembok Serde & Serde_json ke Zaman Purba (Sebelum ada serde_core)
-# Indexmap kita biarkan bebas agar Alloy tidak ngambek.
-# ==========================================
-serde = { version = "=1.0.210", features = ["derive"] }
-serde_derive = "=1.0.210"
-serde_json = "=1.0.128"
-dashmap = "6.1.0"
-futures-util = "0.3.32"
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
